@@ -225,10 +225,6 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
     ((1 / global_batch_size) * loss).backward()
 
     grad = train_state.model.model.puzzle_emb.local_weights.grad
-    if grad is None:
-        print("Gradient is None for this batch.")
-    else:
-        print("Gradient exists! Sum:", grad.sum().item())
 
     # Allreduce
     if world_size > 1:
@@ -288,13 +284,24 @@ def evaluate(config: PretrainConfig, train_state: TrainState, eval_loader: torch
 
             # Forward
             ponder_step = 0
+            batch_metrics = None  # Create an empty bucket to hold the accumulated metrics
+            
             while True:
-                carry, _, metrics, preds, all_finish = train_state.model(carry=carry, batch=batch, return_keys=config.eval_save_outputs)
+                carry, _, step_metrics, preds, all_finish = train_state.model(carry=carry, batch=batch, return_keys=config.eval_save_outputs)
                 
+                # Add this step's metrics to our total batch bucket
+                if batch_metrics is None:
+                    batch_metrics = {k: v.clone() for k, v in step_metrics.items()}
+                else:
+                    for k, v in step_metrics.items():
+                        batch_metrics[k] += v
+
                 ponder_step += 1
-                # Safety break: Force it to stop pondering after 15 steps to prevent infinite loops
                 if all_finish or ponder_step >= 15:
                     break
+            
+            # Pass the accumulated bucket forward
+            metrics = batch_metrics
 
             for collection in (batch, preds):
                 for k, v in collection.items():
@@ -334,6 +341,10 @@ def evaluate(config: PretrainConfig, train_state: TrainState, eval_loader: torch
                 # Postprocess
                 for set_name, metrics in reduced_metrics.items():
                     count = metrics.pop("count")
+                    
+                    # FIX: Prevent divide-by-zero when test labels are hidden
+                    count = max(count, 1.0) 
+                    
                     reduced_metrics[set_name] = {k: v / count for k, v in metrics.items()}
 
                 return reduced_metrics

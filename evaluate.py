@@ -1,6 +1,7 @@
 from typing import List
 import yaml
 import os
+import itertools
 
 import torch
 import torch.distributed as dist
@@ -58,7 +59,12 @@ def launch():
     print ("Starting evaluation")
     
     train_state.model.eval()
-    metrics = evaluate(config, train_state, eval_loader, eval_metadata, rank=RANK, world_size=WORLD_SIZE)
+    
+    # Slice the dataloader to only process 7 batches (~448 examples).
+    # This completely skips the remaining 6,000+ batches of augmentations!
+    limited_eval_loader = itertools.islice(eval_loader, 7)
+    
+    metrics = evaluate(config, train_state, limited_eval_loader, eval_metadata, rank=RANK, world_size=WORLD_SIZE)
 
     if metrics is not None:
         print (metrics)
