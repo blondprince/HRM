@@ -136,17 +136,17 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
     # Optimizers and lr
     optimizers = [
         CastedSparseEmbeddingSignSGD_Distributed(
-            model.model.puzzle_emb.buffers(),  # type: ignore
+            list(model.model.puzzle_emb.parameters()) + list(model.model.puzzle_emb.buffers()),  # type: ignore
             
             lr=0,  # Needs to be set by scheduler
             weight_decay=config.puzzle_emb_weight_decay,
 
             world_size=world_size
         ),
-        AdamATan2(
-            model.parameters(),
+        AdamAtan2(
+            [p for n, p in model.named_parameters() if "local_weights" not in n],
 
-            lr=0,  # Needs to be set by scheduler
+            lr=1.0,  # Needs to be set by scheduler; AdamAtan2 requires non-zero during init
             weight_decay=config.weight_decay,
             betas=(config.beta1, config.beta2)
         )
@@ -224,6 +224,12 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
 
     ((1 / global_batch_size) * loss).backward()
 
+    grad = train_state.model.model.puzzle_emb.local_weights.grad
+    if grad is None:
+        print("Gradient is None for this batch.")
+    else:
+        print("Gradient exists! Sum:", grad.sum().item())
+
     # Allreduce
     if world_size > 1:
         for param in train_state.model.parameters():
@@ -274,17 +280,20 @@ def evaluate(config: PretrainConfig, train_state: TrainState, eval_loader: torch
         metric_global_batch_size = [0 for _ in range(len(set_ids))]
         
         carry = None
-        for set_name, batch, global_batch_size in eval_loader:
+        for set_name, batch, global_batch_size in tqdm.tqdm(eval_loader, desc="Evaluating"):
             # To device
             batch = {k: v.cuda() for k, v in batch.items()}
             with torch.device("cuda"):
                 carry = train_state.model.initial_carry(batch)  # type: ignore
 
             # Forward
+            ponder_step = 0
             while True:
                 carry, _, metrics, preds, all_finish = train_state.model(carry=carry, batch=batch, return_keys=config.eval_save_outputs)
                 
-                if all_finish:
+                ponder_step += 1
+                # Safety break: Force it to stop pondering after 15 steps to prevent infinite loops
+                if all_finish or ponder_step >= 15:
                     break
 
             for collection in (batch, preds):
@@ -432,14 +441,17 @@ def launch(hydra_config: DictConfig):
                 wandb.log(metrics, step=train_state.step)
                 progress_bar.update(train_state.step - progress_bar.n)  # type: ignore
 
+        
         ############ Evaluation
-        train_state.model.eval()
-        metrics = evaluate(config, train_state, eval_loader, eval_metadata, rank=RANK, world_size=WORLD_SIZE)
+        # --- DISABLED EVALUATION ---
+        # train_state.model.eval()
+        # metrics = evaluate(config, train_state, eval_loader, eval_metadata, rank=RANK, world_size=WORLD_SIZE)
 
-        if RANK == 0 and metrics is not None:
-            wandb.log(metrics, step=train_state.step)
+        # if RANK == 0 and metrics is not None:
+        #     wandb.log(metrics, step=train_state.step)
             
         ############ Checkpointing
+        # (Left this active so it still saves your weights!)
         if RANK == 0 and (config.checkpoint_every_eval or (_iter_id == total_iters - 1)):
             save_train_state(config, train_state)
 

@@ -7,6 +7,7 @@ import sys
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 from pydantic import BaseModel
 
 from models.common import trunc_normal_init_
@@ -88,11 +89,30 @@ class Mamba3LBlock(nn.Module):
             is_mimo=True,
             mimo_rank=config.mamba_mimo_rank,
             is_outproj_norm=False,
+            chunk_size=8,
         )
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, injection: Optional[torch.Tensor] = None) -> torch.Tensor:
+        if injection is not None:
+            hidden_states = hidden_states + injection
+            
+        orig_seq_len = hidden_states.shape[1]
+        chunk_size = self.mamba.chunk_size
+
+        # Pad sequence length to be divisible by chunk_size (Mamba-3 kernel requirement)
+        m_input = hidden_states
+        q, r = divmod(orig_seq_len, chunk_size)
+        if r > 0:
+            padding_len = chunk_size - r
+            m_input = F.pad(hidden_states, (0, 0, 0, padding_len))
+
         # Residual Mamba-3 MIMO over token representations
-        m_out = self.mamba(hidden_states)
+        m_out = self.mamba(m_input)
+
+        # Slice back to original length
+        if r > 0:
+            m_out = m_out[:, :orig_seq_len]
+
         return rms_norm(hidden_states + m_out, variance_epsilon=self.norm_eps)
 
 
@@ -113,12 +133,29 @@ class Mamba3HBlock(nn.Module):
             ngroups=config.mamba_ngroups,
             is_mimo=False,
             is_outproj_norm=True,
+            chunk_size=64,
         )
 
     def forward(self, hidden_states: torch.Tensor, injection: torch.Tensor) -> torch.Tensor:
         # Additively inject lower-level state, then run Mamba-3 SSM.
         hidden_states = hidden_states + injection
-        m_out = self.mamba(hidden_states)
+
+        orig_seq_len = hidden_states.shape[1]
+        chunk_size = self.mamba.chunk_size
+
+        # Pad sequence length to be divisible by chunk_size (Mamba-3 kernel requirement)
+        m_input = hidden_states
+        q, r = divmod(orig_seq_len, chunk_size)
+        if r > 0:
+            padding_len = chunk_size - r
+            m_input = F.pad(hidden_states, (0, 0, 0, padding_len))
+
+        m_out = self.mamba(m_input)
+
+        # Slice back to original length
+        if r > 0:
+            m_out = m_out[:, :orig_seq_len]
+
         return rms_norm(hidden_states + m_out, variance_epsilon=self.norm_eps)
 
 
@@ -135,10 +172,8 @@ class MambaHRMReasoningModule(nn.Module):
     def forward(self, hidden_states: torch.Tensor, injection: torch.Tensor, **kwargs) -> torch.Tensor:
         del kwargs  # unused, kept for HRM API symmetry
         for layer in self.layers:
-            if isinstance(layer, Mamba3HBlock):
-                hidden_states = layer(hidden_states, injection)
-            else:
-                hidden_states = layer(hidden_states)
+            # Now both L and H blocks can accept the injection
+            hidden_states = layer(hidden_states, injection)
         return hidden_states
 
 
@@ -178,7 +213,10 @@ class MambaHRMInner(nn.Module):
                 init_std=0,
                 cast_to=self.forward_dtype,
             )
-
+            # FIX: Force the hidden buffers to require gradients so the custom optimizer receives them
+            for buf in self.puzzle_emb.buffers():
+                if buf.is_floating_point():
+                    buf.requires_grad_(True)
         # Reasoning layers
         self.H_level = MambaHRMReasoningModule(
             layers=[Mamba3HBlock(self.config) for _ in range(self.config.H_layers)]
@@ -201,6 +239,23 @@ class MambaHRMInner(nn.Module):
         with torch.no_grad():
             self.q_head.weight.zero_()
             self.q_head.bias.fill_(-5)  # type: ignore
+
+        # Cast Mamba reasoning blocks to forward_dtype, but preserve Float32 for kernels
+        for level in [self.H_level, self.L_level]:
+            level.to(self.forward_dtype)
+            for m in level.modules():
+                if isinstance(m, Mamba3):
+                    # These specific parameters must remain in float32 for the Triton kernels
+                    m.B_bias.data = m.B_bias.data.float()
+                    m.C_bias.data = m.C_bias.data.float()
+                    m.D.data = m.D.data.float()
+                    m.dt_bias.data = m.dt_bias.data.float()
+                    if hasattr(m, "mimo_x") and m.mimo_x is not None:
+                        m.mimo_x.data = m.mimo_x.data.float()
+                    if hasattr(m, "mimo_z") and m.mimo_z is not None:
+                        m.mimo_z.data = m.mimo_z.data.float()
+                    if hasattr(m, "mimo_o") and m.mimo_o is not None:
+                        m.mimo_o.data = m.mimo_o.data.float()
 
     def _input_embeddings(self, input: torch.Tensor, puzzle_identifiers: torch.Tensor):
         # Token embedding
@@ -247,8 +302,9 @@ class MambaHRMInner(nn.Module):
     def forward(
         self, carry: MambaHRMInnerCarry, batch: Dict[str, torch.Tensor]
     ) -> Tuple[MambaHRMInnerCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        # Input encoding
-        input_embeddings = self._input_embeddings(batch["inputs"], batch["puzzle_identifiers"])
+        # Input encoding for pondering loop (calculated without grad later)
+        with torch.no_grad():
+            input_embeddings_ponder = self._input_embeddings(batch["inputs"], batch["puzzle_identifiers"])
 
         # Latent pondering loop (gradient-free warm-up)
         with torch.no_grad():
@@ -259,7 +315,7 @@ class MambaHRMInner(nn.Module):
                 for _L_step in range(self.config.L_cycles):
                     if not ((_H_step == self.config.H_cycles - 1) and (_L_step == self.config.L_cycles - 1)):
                         # L-level only sees (H state + inputs)
-                        z_L = self.L_level(z_L, injection=z_H + input_embeddings)
+                        z_L = self.L_level(z_L, injection=z_H + input_embeddings_ponder)
 
                 # H-module updates slower, over L-level state
                 if not (_H_step == self.config.H_cycles - 1):
@@ -268,8 +324,26 @@ class MambaHRMInner(nn.Module):
         assert not z_H.requires_grad and not z_L.requires_grad
 
         # Final 1-step gradient update (trainable pondering step)
-        z_L = self.L_level(z_L, injection=z_H + input_embeddings)
-        z_H = self.H_level(z_H, injection=z_L)
+        def trainable_step(z_H_in, z_L_in, embed_in, dummy_in):
+            z_L_out = self.L_level(z_L_in, injection=z_H_in + embed_in.to(z_H_in.dtype))
+            z_H_out = self.H_level(z_H_in, injection=z_L_out)
+            # Ensure the output depends on dummy_in to trigger gradient checkpointing correctly.
+            if dummy_in is not None:
+                z_H_out = z_H_out + dummy_in.to(z_H_out.dtype).view(-1)[0] * 0
+                z_L_out = z_L_out + dummy_in.to(z_L_out.dtype).view(-1)[0] * 0
+            return z_H_out, z_L_out
+
+        if self.training:
+            # Use gradient checkpointing to save VRAM during the trainable step.
+            # Using use_reentrant=True as the Mamba-3 Triton kernels have issues with multiple
+            # saved tensor unpacks in the modern non-reentrant mode.
+            # We pass embed_in explicitly to ensure clear gradient tracking.
+            embed_in = self._input_embeddings(batch["inputs"], batch["puzzle_identifiers"])
+            dummy = torch.zeros(1, device=z_H.device, dtype=self.forward_dtype, requires_grad=True)
+            z_H, z_L = checkpoint(trainable_step, z_H, z_L, embed_in, dummy, use_reentrant=True)
+        else:
+            embed_in = self._input_embeddings(batch["inputs"], batch["puzzle_identifiers"])
+            z_H, z_L = trainable_step(z_H, z_L, embed_in, None)
 
         # LM Outputs
         new_carry = MambaHRMInnerCarry(z_H=z_H.detach(), z_L=z_L.detach())
@@ -338,11 +412,12 @@ class HierarchicalReasoningModel_Mamba3ACTV1(nn.Module):
 
             halted = is_last_step
 
-            # if training, and ACT is enabled
-            if self.training and (self.config.halt_max_steps > 1):
-                # Halt signal
+            # ACT Halting: The model must be allowed to halt during BOTH training and evaluation!
+            if self.config.halt_max_steps > 1:
                 halted = halted | (q_halt_logits > q_continue_logits)
 
+            # Exploration and Bootstrapping: Training only
+            if self.training and (self.config.halt_max_steps > 1):
                 # Exploration
                 min_halt_steps = (
                     (torch.rand_like(q_halt_logits) < self.config.halt_exploration_prob)

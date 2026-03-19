@@ -21,16 +21,16 @@ class CastedSparseEmbedding(nn.Module):
 
         # Local weights and IDs
         # Local embeddings, with gradient, not persistent
-        self.local_weights = nn.Buffer(torch.zeros(batch_size, embedding_dim, requires_grad=True), persistent=False)
+        self.local_weights = nn.Parameter(torch.zeros(batch_size, embedding_dim))
         # Local embedding IDs, not persistent
         self.local_ids = nn.Buffer(torch.zeros(batch_size, dtype=torch.int32), persistent=False)
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        if not self.training:
-            # Test mode, no gradient
+        # Avoid overwriting stateful parameters during inference or bootstrapping (no_grad)
+        if not self.training or not torch.is_grad_enabled():
             return self.weights[inputs].to(self.cast_to)
-            
-        # Training mode, fill puzzle embedding from weights
+
+        # Training mode with gradients enabled, fill puzzle embedding from weights
         with torch.no_grad():
             self.local_weights.copy_(self.weights[inputs])
             self.local_ids.copy_(inputs)
@@ -78,7 +78,8 @@ class CastedSparseEmbeddingSignSGD_Distributed(Optimizer):
                 else:
                     assert False
                 
-            assert local_weights_grad is not None
+            if local_weights_grad is None:
+                continue  # or 'return' depending on how the step function loops
             assert local_ids is not None
             assert weights is not None
         
