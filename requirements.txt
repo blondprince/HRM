@@ -1,4 +1,5 @@
 torch
+adam-atan2
 einops
 tqdm
 coolname
