@@ -14,19 +14,8 @@ from models.layers import rms_norm, CosSin, CastedEmbedding, CastedLinear
 from models.sparse_embedding import CastedSparseEmbedding
 
 
-#
-# Ensure the local Mamba-3 repository is importable when running
-# from inside the HRM project directory.
-#
-# Make sure the local `mamba/` repo is importable.
-# On both local and server layouts, `mamba/` is expected to be a sibling of `HRM/`
-# (i.e. project root contains both `mamba/` and `HRM/`).
-_PROJECT_ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-if _PROJECT_ROOT_DIR not in sys.path:
-    sys.path.append(_PROJECT_ROOT_DIR)
-
-# Import Mamba-3 from the local repository (not from a separately installed package).
-from mamba.mamba_ssm.modules.mamba3 import Mamba3  # type: ignore[import]
+# Import Mamba-3 from the installed mamba_ssm package.
+from mamba_ssm.modules.mamba3 import Mamba3
 
 
 @dataclass
