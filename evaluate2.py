@@ -46,7 +46,8 @@ def run_few_shot_eval(config, train_state, loader, num_puzzles_to_eval):
                         return_keys=[]
                     )
                     ponder_step += 1
-                    if all_finish or ponder_step >= 10:
+                    # INCREASED FROM 10 TO 40
+                    if all_finish or ponder_step >= 40: 
                         break
             
             # 2. TEST PASS
@@ -57,13 +58,19 @@ def run_few_shot_eval(config, train_state, loader, num_puzzles_to_eval):
                 carry, _, _, outputs, all_finish = model(
                     carry=carry, 
                     batch=test_sub_batch, 
-                    return_keys=config.eval_save_outputs
+                    # --- CRITICAL FIX: Explicitly ask for logits ---
+                    return_keys=["logits"] 
                 )
                 ponder_step += 1
-                if all_finish or ponder_step >= 15:
+                # INCREASED FROM 15 TO 40
+                if all_finish or ponder_step >= 40: 
                     break
             
             # 3. SCORING
+            if outputs is None or "logits" not in outputs:
+                print(f"\nERROR: Model did not return logits! Found: {list(outputs.keys()) if outputs else 'None'}")
+                break
+
             final_logits = outputs["logits"] 
             preds = final_logits.argmax(dim=-1).squeeze(0) 
             labels = test_sub_batch["labels"].squeeze(0)   
