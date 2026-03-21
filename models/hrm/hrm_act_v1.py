@@ -11,6 +11,9 @@ from models.common import trunc_normal_init_
 from models.layers import rms_norm, SwiGLU, Attention, RotaryEmbedding, CosSin, CastedEmbedding, CastedLinear
 from models.sparse_embedding import CastedSparseEmbedding
 
+from mamba_ssm.modules.mamba3 import Mamba3
+from torch.utils.checkpoint import checkpoint
+
 
 @dataclass
 class HierarchicalReasoningModel_ACTV1InnerCarry:
@@ -61,25 +64,18 @@ class HierarchicalReasoningModel_ACTV1Block(nn.Module):
     def __init__(self, config: HierarchicalReasoningModel_ACTV1Config) -> None:
         super().__init__()
 
-        self.self_attn = Attention(
-            hidden_size=config.hidden_size,
-            head_dim=config.hidden_size // config.num_heads,
-            num_heads=config.num_heads,
-            num_key_value_heads=config.num_heads,
-            causal=False
-        )
-        self.mlp = SwiGLU(
-            hidden_size=config.hidden_size,
-            expansion=config.expansion,
+        self.mamba = Mamba3(
+            d_model=config.hidden_size,
+            expand=config.expansion,
+            headdim=config.hidden_size // config.num_heads,
+            is_mimo=True,
+            chunk_size=8,
         )
         self.norm_eps = config.rms_norm_eps
 
     def forward(self, cos_sin: CosSin, hidden_states: torch.Tensor) -> torch.Tensor:
-        # Post Norm
-        # Self Attention
-        hidden_states = rms_norm(hidden_states + self.self_attn(cos_sin=cos_sin, hidden_states=hidden_states), variance_epsilon=self.norm_eps)
-        # Fully Connected
-        hidden_states = rms_norm(hidden_states + self.mlp(hidden_states), variance_epsilon=self.norm_eps)
+        # Mamba replaces both Attention and MLP
+        hidden_states = rms_norm(hidden_states + self.mamba(hidden_states), variance_epsilon=self.norm_eps)
         return hidden_states
 
 
@@ -94,7 +90,10 @@ class HierarchicalReasoningModel_ACTV1ReasoningModule(nn.Module):
         hidden_states = hidden_states + input_injection
         # Layers
         for layer in self.layers:
-            hidden_states = layer(hidden_states=hidden_states, **kwargs)
+            if self.training:
+                hidden_states = checkpoint(layer, kwargs.get("cos_sin"), hidden_states, use_reentrant=True)
+            else:
+                hidden_states = layer(cos_sin=kwargs.get("cos_sin"), hidden_states=hidden_states)
 
         return hidden_states
 
